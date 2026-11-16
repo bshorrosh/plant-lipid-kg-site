@@ -57,6 +57,12 @@
      whatever the wrapped page itself put in that same corner (e.g. the
      KG's own Help/License tabs). */
   #content.has-app { padding: 0; position: fixed; top: 28px; left: 0; right: 0; bottom: 0; z-index: 1; }
+  /* Shared-notes review page, signed in, nothing to report: no strip at
+     all (decided with the user) -- Sign out lives in the content's own tab
+     row (wrappedAppApi.signOut). The strip comes back for a problem
+     (showProblem) or while not signed in. */
+  #toolbar.connected.quiet { display: none; }
+  body.quiet-toolbar #content.has-app { top: 0; }
   #appFrame { width: 100%; height: 100%; border: none; display: block; }
   #loadingOverlay {
     display: none; position: fixed; inset: 0; z-index: 3; background: rgba(255,255,255,.92);
@@ -93,7 +99,10 @@
   dialog .hint { color: #777; font-size: 12px; margin: 6px 0 12px; max-width: 420px; }
   dialog .error { color: #b3261e; min-height: 1em; margin: 4px 0 8px; }
 </style>
-<meta name="litehusk-template" content="build.bin?v=2026-11-14%2019%3A37">
+<meta name="litehusk-template" content="build.bin?v=2026-11-15%2017%3A31">
+<meta name="litehusk-notes" content="shared">
+<meta name="litehusk-notes-url" content="https://script.google.com/macros/s/AKfycbxEFItFOQ7nzZkwaB7yIngy91ot3Y_grezg1E1iGlNb_ORicXILaGBJXeUxhVBEIwU2Fg/exec">
+<meta name="litehusk-google-client" content="477322984968-31t0k2ntulcrn9dacjg7am4ig1172094.apps.googleusercontent.com">
 </head>
 <body>
 
@@ -107,9 +116,11 @@
   <button id="btnUnlock" style="display:none">Unlock</button>
   <input type="file" id="fileInputFallback" accept=".husk">
   <span class="status" id="status">Not connected to a file yet.</span>
+  <span id="googleSignIn" style="display:none"></span>
   <span id="browserWarning">⚠ View only in this browser -- it can't save to your file. To add notes, open this page in Chrome or Edge.
     <button id="btnCopyLink">Copy page link</button></span>
   <div id="menu">
+    <button id="btnSignOut" style="display:none" title="Sign out of the review page on this browser">Sign out</button>
     <button id="btnLoadNotes" style="display:none" title="Show your saved notes again"></button>
     <button id="btnOpenNotes" style="display:none" title="Open a notes file, e.g. one from another computer">Open notes file…</button>
     <button id="btnNewNotes" style="display:none" title="Clear the notes shown (they stay in their file); your next note starts a new notes file">Start a new notes file</button>
@@ -137,6 +148,15 @@
   The first time you save, your browser will ask
   permission to do this -- click <b>Allow</b>. That's what lets your work keep saving to that
   same file from then on.
+  </div>
+  <!-- Shown instead on a review page whose build has shared notes
+       (embed_templates.py --site adds <meta name="litehusk-notes">). -->
+  <div id="welcomeShared" style="display:none">
+  <b>Sign in with Google</b> (button above), using the email address your invitation was sent to.
+  No password needed. The review content opens, with everyone's notes.
+  <b>Your notes are shared with the other reviewers</b> and saved as you write them -- nothing
+  to download or send. You can change only your own notes.
+  This browser stays signed in for 30 days; <b>Sign out</b> is next to <b>Help</b>, which also explains how reviewing works.
   </div>
   <!-- Shown instead on a page that carries a build (the review page). -->
   <div id="welcomeBuild" style="display:none">
@@ -861,6 +881,9 @@ var LiteHuskBundle = (() => {
       return false;
     }
   }
+  function getSetting(db, key) {
+    return getSettingValue(db, key);
+  }
   function getBuildLabel(db) {
     return getSettingValue(db, "build_label");
   }
@@ -1032,6 +1055,35 @@ var LiteHuskBundle = (() => {
     return false;
   }
 
+  // src/remote-notes.js
+  function storeError(data) {
+    const err = new Error(data && data.error || "The shared notes couldn't be reached.");
+    const code = data && data.code;
+    err.name = code === "not-listed" ? "ReviewerNotListedError" : code === "sign-in" || code === "bad-token" || code === "expired" ? "SignInRequiredError" : "NotesStoreError";
+    err.code = code || null;
+    return err;
+  }
+  async function callNotesStore(url, body) {
+    let data;
+    try {
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body) });
+      data = await res.json();
+    } catch (err) {
+      throw storeError({ error: "The shared notes couldn't be reached -- check the internet connection." });
+    }
+    if (!data || !data.ok) throw storeError(data);
+    return data;
+  }
+  function emailFromIdToken(token) {
+    try {
+      const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const json = JSON.parse(decodeURIComponent(escape(atob(part + "=".repeat((4 - part.length % 4) % 4)))));
+      return { email: String(json.email || "").toLowerCase() || null, expiresAt: json.exp ? json.exp * 1e3 : null, name: json.name || null };
+    } catch {
+      return { email: null, expiresAt: null, name: null };
+    }
+  }
+
   // src/litebox.js
   function packPlain(bytes, compressed) {
     return (compressed ? "PLAIN2:" : "PLAIN1:") + bytesToBase64(bytes);
@@ -1099,6 +1151,19 @@ var LiteHuskBundle = (() => {
     // The build label of the built-in build (admin.getBuildLabel), stamped on
     // every note written on it.
     _buildLabel: null,
+    // The shared notes store (remote-notes.js), when the built-in build
+    // carries its settings (notes_url + notes_key, plus google_client_id for
+    // the page's sign-in): {url, key, clientId}. Then notes are saved to and
+    // loaded from it -- everyone's, not just this person's -- instead of a
+    // notes file, and identity is a Google sign-in.
+    _remote: null,
+    _googleToken: null,
+    _googleTokenExpires: 0,
+    _googleEmail: null,
+    _session: null,
+    // the notes script's 30-day pass (see _auth)
+    onSignOutRequested: null,
+    // set by the shell; see wrappedAppApi.signOut
     // Wrapped-app callbacks for "the notes changed under you" (a notes file
     // loaded, notes imported) -- see wrappedAppApi.onNotesChanged.
     _notesListeners: /* @__PURE__ */ new Set(),
@@ -1206,6 +1271,7 @@ var LiteHuskBundle = (() => {
     // change made there is easy to lose for good.
     allowDownloadSaves: true,
     get canSave() {
+      if (this.remoteNotes) return true;
       return this.supportsSelfSave || this.allowDownloadSaves;
     },
     // Checked BEFORE anything changes in memory, so a refused edit leaves
@@ -1629,6 +1695,9 @@ var LiteHuskBundle = (() => {
       this.fileHandle = null;
       this._fromBuild = true;
       this._buildLabel = getBuildLabel(this.db);
+      const notesUrl = getSetting(this.db, "notes_url");
+      const notesKey = getSetting(this.db, "notes_key");
+      this._remote = notesUrl && notesKey ? { url: notesUrl, key: notesKey, clientId: getSetting(this.db, "google_client_id") } : null;
       this.notesHandle = null;
       this._defaultFileName = suggestedName;
       this._notifyNotesChanged();
@@ -1784,7 +1853,7 @@ var LiteHuskBundle = (() => {
     },
     async _saveNow(suggestedName, downloadName) {
       if (!this.db) throw new Error("No open database -- call newFile() or openFile() first.");
-      if (this._fromBuild) return this._saveNotesNow();
+      if (this._fromBuild) return this.remoteNotes ? this._saveRemoteNow() : this._saveNotesNow();
       suggestedName = suggestedName || this._defaultFileName;
       downloadName = downloadName || this._defaultFileName;
       let justEstablishedHandle = false;
@@ -1843,6 +1912,170 @@ var LiteHuskBundle = (() => {
       }
       this.onSaved?.(result);
       return result;
+    },
+    // --- The shared notes store (built-in build with notes settings) ---
+    get remoteNotes() {
+      return !!(this._fromBuild && this._remote);
+    },
+    // The OAuth client id the page's "Sign in with Google" needs.
+    get googleClientId() {
+      return this.remoteNotes ? this._remote.clientId : null;
+    },
+    // The Google Sign-In credential (an ID token) from the page. Its email is
+    // read only for display; the script verifies the token with Google.
+    setGoogleCredential(idToken) {
+      const { email, expiresAt } = emailFromIdToken(idToken);
+      this._googleToken = idToken;
+      this._googleTokenExpires = expiresAt || 0;
+      this._googleEmail = email;
+      return { email, expiresAt };
+    },
+    // Staying signed in. Google's token lasts an hour; every reply the notes
+    // script gives a Google-signed request also carries its own 30-day pass
+    // ("session", signed by the script -- see Code.gs), kept in this browser
+    // so a reload is signed in at once, with no Google popup. Sent instead of
+    // the token once the token has expired. The script still checks the
+    // Reviewers tab on every request.
+    _sessionKey(url) {
+      return `litehusk:session:${url}`;
+    },
+    _auth() {
+      if (this._googleToken && this._googleTokenExpires > Date.now() + 6e4) return { idToken: this._googleToken };
+      if (this._session) return { session: this._session };
+      return null;
+    },
+    get signedIn() {
+      return !!this._auth();
+    },
+    _keepSession(url, res) {
+      if (!res || !res.session) return;
+      this._session = res.session;
+      try {
+        localStorage.setItem(this._sessionKey(url), JSON.stringify({ email: res.email, session: res.session }));
+      } catch {
+      }
+    },
+    _dropSession(url) {
+      this._session = null;
+      try {
+        localStorage.removeItem(this._sessionKey(url));
+      } catch {
+      }
+    },
+    // Picks up the pass a previous visit kept (no network). Returns the email
+    // it's for, or null. The script decides whether it's still good.
+    resumeSession(url) {
+      try {
+        const kept = JSON.parse(localStorage.getItem(this._sessionKey(url)) || "null");
+        if (kept && kept.session && kept.email) {
+          this._session = kept.session;
+          this._googleEmail = kept.email;
+          return kept.email;
+        }
+      } catch {
+      }
+      return null;
+    },
+    // One call to the notes script with whatever proves who this is; keeps a
+    // fresh pass, and forgets one the script no longer accepts.
+    async _callSignedIn(url, body) {
+      const auth = this._auth();
+      try {
+        const res = await callNotesStore(url, { ...body, ...auth });
+        this._keepSession(url, res);
+        return res;
+      } catch (err) {
+        if (auth && auth.session && err.name === "SignInRequiredError") {
+          this._dropSession(url);
+          if (!this._googleToken) this._googleEmail = null;
+        }
+        throw err;
+      }
+    },
+    // Opens the built-in build without a password: the notes script checks the
+    // Google sign-in and the Reviewers tab, then hands over the build's key
+    // (derived once from the password and the fixed build salt -- the same key
+    // a typed password produces).
+    // `idToken` null: use the pass a previous visit kept (resumeSession).
+    async unlockWithGoogle(notesUrl, idToken) {
+      if (idToken) this.setGoogleCredential(idToken);
+      const res = await this._callSignedIn(notesUrl, { action: "unlock" });
+      const raw = Uint8Array.from(atob(res.buildKey), (c) => c.charCodeAt(0));
+      const key = await importKeyBytes(raw);
+      await this.startFromTemplate(key);
+      if (res.email) this._googleEmail = res.email;
+      return this._googleEmail;
+    },
+    signOutGoogle(url) {
+      this._googleToken = null;
+      this._googleTokenExpires = 0;
+      this._googleEmail = null;
+      this._dropSession(url || this._remote && this._remote.url);
+    },
+    // This person's notes are also kept in this browser until the store has
+    // them, so a save that fails (offline, sign-in expired) isn't lost: the
+    // next load or save sends them again.
+    _pendingKey() {
+      return `litehusk:pending-notes:${this._remote.url}:${this._googleEmail}`;
+    },
+    _readPending() {
+      try {
+        return JSON.parse(localStorage.getItem(this._pendingKey()) || "[]");
+      } catch {
+        return [];
+      }
+    },
+    _writePending(notes) {
+      try {
+        if (notes && notes.length) localStorage.setItem(this._pendingKey(), JSON.stringify(notes));
+        else localStorage.removeItem(this._pendingKey());
+      } catch {
+      }
+    },
+    _myNoteRecords() {
+      const me = this.currentUser;
+      return exportNoteRecords(this.db).notes.filter((n) => n.author === me);
+    },
+    // Sends all of this person's notes (a handful -- simpler and safer than
+    // tracking which changed); the store keeps the newest version of each.
+    async _saveRemoteNow() {
+      if (!this.signedIn) {
+        const err = new Error("Sign in with Google to save notes.");
+        err.name = "SignInRequiredError";
+        throw err;
+      }
+      const notes = this._myNoteRecords();
+      this._writePending(notes);
+      const res = await this._callSignedIn(this._remote.url, { action: "save", key: this._remote.key, notes });
+      this._writePending(null);
+      const result = { mode: "saved-remote", justEstablishedHandle: false, counts: res.counts };
+      this.onSaved?.(result);
+      return result;
+    },
+    // Everyone's notes from the store. `replace`: start from exactly what the
+    // store has (after sign-in); otherwise merge newest-wins (the periodic
+    // refresh). Notes still waiting in this browser are merged in and sent.
+    // `opened`: the page was just opened (not the periodic refresh) -- the
+    // store records the visit (Log, and the Reviewers tab's last_opened).
+    async loadRemoteNotes({ replace = false, opened = false } = {}) {
+      if (!this.remoteNotes) throw new Error("This build has no shared notes.");
+      if (!this.signedIn) {
+        const err = new Error("Sign in with Google to see the notes.");
+        err.name = "SignInRequiredError";
+        throw err;
+      }
+      const res = await this._callSignedIn(this._remote.url, { action: "load", key: this._remote.key, ...opened ? { opened: true } : {} });
+      if (res.email) this._googleEmail = res.email;
+      if (replace) clearNotes(this.db);
+      mergeNoteRecords(this.db, { notes: res.notes || [] });
+      const pending = this._readPending();
+      if (pending.length) {
+        mergeNoteRecords(this.db, { notes: pending });
+        this.save().catch(() => {
+        });
+      }
+      this._notifyNotesChanged();
+      return { count: this.getAllNotes().length, email: res.email || this._googleEmail };
     },
     // --- The notes file (built-in build only; see _fromBuild) ---
     _suggestedNotesName() {
@@ -1948,7 +2181,7 @@ var LiteHuskBundle = (() => {
     // parent from the same-origin iframe). No remembered file: nothing to do
     // -- the save asks where to put a new one.
     async _ensureNotesFileLoaded() {
-      if (!this._fromBuild || this.notesHandle || !this._lastNotesHandle) return;
+      if (!this._fromBuild || this.remoteNotes || this.notesHandle || !this._lastNotesHandle) return;
       const handle = this._lastNotesHandle;
       if (!await ensureReadWritePermission(handle)) {
         const err = new Error(`Your notes file "${handle.name}" isn't open, so nothing was saved. Use "Load my notes", or "Start a new notes file".`);
@@ -2023,7 +2256,8 @@ var LiteHuskBundle = (() => {
     // notes apart after a merge, and the reviewer list keeps it to real,
     // consistently spelled addresses.
     get currentUser() {
-      return this._login ? this._login.email : this._identity;
+      if (this._login) return this._login.email;
+      return this.remoteNotes ? this._googleEmail : this._identity;
     },
     _identity: null,
     _identityHash: null,
@@ -2059,6 +2293,14 @@ var LiteHuskBundle = (() => {
     // email. Per-person files are already proven by their own login.
     _requireListedIdentity() {
       if (this._login) return;
+      if (this.remoteNotes) {
+        if (!this.signedIn) {
+          const err = new Error("Sign in with Google to add notes.");
+          err.name = "SignInRequiredError";
+          throw err;
+        }
+        return;
+      }
       const list = this.db ? getReviewerHashes(this.db) : null;
       if (list && !(this._identityHash && list.includes(this._identityHash))) {
         const err = new Error("Enter your email (one on the reviewer list) to add or change notes.");
@@ -2136,6 +2378,13 @@ var LiteHuskBundle = (() => {
     get currentBuild() {
       return LiteHusk.currentBuild;
     },
+    // Shared-notes review page: someone is signed in, so the app may offer
+    // "Sign out" in its own UI; signOut() asks the shell to do it (the shell
+    // sets LiteHusk.onSignOutRequested -- the app never signs out by itself).
+    get canSignOut() {
+      return !!(LiteHusk.remoteNotes && LiteHusk.currentUser && LiteHusk.onSignOutRequested);
+    },
+    signOut: () => LiteHusk.onSignOutRequested?.(),
     getNotesForTarget: (targetKey) => LiteHusk.getNotesForTarget(targetKey),
     // Every live note -- for finding notes whose row no longer exists.
     getAllNotes: () => LiteHusk.getAllNotes(),
@@ -2190,6 +2439,8 @@ const btnAdmin = document.getElementById('btnAdmin');
 const btnToggleMode = document.getElementById('btnToggleMode');
 const btnImportNotes = document.getElementById('btnImportNotes');
 const btnLoadNotes = document.getElementById('btnLoadNotes');
+const btnSignOut = document.getElementById('btnSignOut');
+const googleSignInSlot = document.getElementById('googleSignIn');
 const btnOpenNotes = document.getElementById('btnOpenNotes');
 const btnNewNotes = document.getElementById('btnNewNotes');
 const btnStartFromTemplate = document.getElementById('btnStartFromTemplate');
@@ -2321,7 +2572,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // is the identity). A file with a reviewer list refuses an unlisted email:
 // viewing still works, notes don't, and the email prompt explains.
 async function ensureIdentity() {
-  if (LiteHusk.hasPersonalLogins || !LiteHusk.db) return;
+  if (LiteHusk.hasPersonalLogins || !LiteHusk.db || LiteHusk.remoteNotes) return;  // Google sign-in instead
   const email = typedEmail || LiteHusk.currentUser || rememberedEmail();
   typedEmail = null;
   if (!email) {
@@ -2466,7 +2717,141 @@ function buildName() {
   return LiteHusk.currentBuild ? `the build of ${LiteHusk.currentBuild}` : 'the latest build';
 }
 
+// ---- Google sign-in (builds with shared notes; see litebox.js remoteNotes)
+// Google Identity Services: the reviewer signs in once per browser; later
+// visits sign in automatically (auto_select). The ID token lasts about an
+// hour, so a fresh one is requested shortly before it expires. The token
+// goes to the notes script, which checks it with Google and the email
+// against the workbook's Reviewers tab.
+let googleReady = null;
+let notesRefreshTimer = null;
+function loadGoogleScript() {
+  googleReady ??= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Google sign-in couldn't load -- check the internet connection."));
+    document.head.appendChild(s);
+  });
+  return googleReady;
+}
+
+// The review page's shared-notes settings, readable before unlocking (see
+// embed_templates.py --site): the notes script and the sign-in client id.
+const SHARED_NOTES_URL = document.querySelector('meta[name="litehusk-notes-url"]')?.content || null;
+const GOOGLE_CLIENT_FROM_PAGE = document.querySelector('meta[name="litehusk-google-client"]')?.content || null;
+const GOOGLE_OPENS_BUILD = !!(SHARED_NOTES_URL && GOOGLE_CLIENT_FROM_PAGE);
+
+async function startGoogleSignIn() {
+  showBuildStatus();
+  try {
+    await loadGoogleScript();
+  } catch (err) {
+    setStatus(err.message);
+    return;
+  }
+  google.accounts.id.initialize({
+    client_id: LiteHusk.googleClientId || GOOGLE_CLIENT_FROM_PAGE,
+    callback: onGoogleCredential,
+    auto_select: true,              // a returning reviewer is signed in without a click
+    cancel_on_tap_outside: false,
+    use_fedcm_for_prompt: true,
+  });
+  googleSignInSlot.style.display = '';
+  google.accounts.id.renderButton(googleSignInSlot, { type: 'standard', size: 'small', text: 'signin_with', theme: 'outline' });
+  google.accounts.id.prompt();      // One Tap / automatic sign-in when possible
+  await updateNotesButtons();
+}
+
+// The strip at the top: hidden on the shared-notes review page while
+// everything is fine, shown again for anything the reviewer must see.
+function setQuiet(quiet) {
+  toolbar.classList.toggle('quiet', quiet);
+  document.body.classList.toggle('quiet-toolbar', quiet);
+}
+function showProblem(text) {
+  setStatus(text);
+  setQuiet(false);
+}
+
+async function onGoogleCredential(response) {
+  if (!LiteHusk.db && GOOGLE_OPENS_BUILD) {
+    // Not opened yet: the sign-in opens the build (no password).
+    showLoading('Opening…');
+    try {
+      await LiteHusk.unlockWithGoogle(SHARED_NOTES_URL, response.credential);
+      await LiteHusk.rememberBuildKey();  // a refresh opens without asking
+    } catch (err) {
+      hideLoading();
+      showProblem(err.name === 'ReviewerNotListedError'
+        ? err.message + ' Ask the person who invited you to add it, or sign in with the email your invitation was sent to.'
+        : 'Not opened: ' + err.message);
+      return;
+    }
+    hideLoading();
+    hidePasswordPrompt();
+    showConnected(null);
+  } else {
+    LiteHusk.setGoogleCredential(response.credential);
+  }
+  googleSignInSlot.style.display = 'none';
+  await loadSharedNotes();
+}
+
+// After sign-in (or a kept 30-day pass, see LiteHusk.resumeSession):
+// everyone's notes, kept current while the page is open.
+let sharedNotesLoaded = false;
+async function loadSharedNotes() {
+  showLoading('Loading the notes…');
+  try {
+    // The first load of this page visit is the one the store records.
+    await LiteHusk.loadRemoteNotes({ replace: true, opened: !sharedNotesLoaded });
+    sharedNotesLoaded = true;
+    showBuildStatus();
+    setQuiet(true);
+    clearInterval(notesRefreshTimer);
+    notesRefreshTimer = setInterval(() => LiteHusk.loadRemoteNotes().catch(() => {}), 90000);
+  } catch (err) {
+    if (err.name === 'SignInRequiredError') {
+      // The kept pass ended (30 days, or everyone was signed out): sign in
+      // with Google once more.
+      hideLoading();
+      showProblem(err.message);
+      await startGoogleSignIn();
+      return;
+    }
+    showProblem(err.name === 'ReviewerNotListedError'
+      ? `${LiteHusk.currentUser || 'This email'} isn't on the reviewer list -- you can view everything, but not see or add notes. Ask the person who invited you to add this email.`
+      : 'Notes not loaded: ' + err.message);
+  } finally {
+    hideLoading();
+  }
+  await updateNotesButtons();
+}
+
+async function signOut() {
+  showLoading('Signing out…');
+  try {
+    await LiteHusk.whenSaved();
+    try { google.accounts.id.disableAutoSelect(); } catch { /* not loaded */ }
+    LiteHusk.signOutGoogle(SHARED_NOTES_URL);
+    await LiteHusk.forgetBuildKey();  // the next person signs in too
+  } finally {
+    location.reload();
+  }
+}
+btnSignOut.addEventListener('click', signOut);
+LiteHusk.onSignOutRequested = signOut;  // the content's own "Sign out" tab
+
 function showBuildStatus() {
+  if (LiteHusk.remoteNotes) {
+    const who = LiteHusk.currentUser;
+    setStatus(who
+      ? `Viewing ${buildName()} -- signed in as ${who} (Google). Notes are shared with the other reviewers.`
+      : `Viewing ${buildName()}. Sign in with Google to see and add notes.`);
+    return;
+  }
   const notes = LiteHusk.notesFileName;
   const editing = LiteHusk.mode === 'review' && LiteHusk.canSave;
   let text = `Viewing ${buildName()} (${LiteHusk.mode} mode)${signedInAs()}.`;
@@ -2482,6 +2867,16 @@ function showBuildStatus() {
 
 async function updateNotesButtons() {
   const build = viewingBuild();
+  if (LiteHusk.remoteNotes) {
+    // Shared notes: nothing to open, start or import, and who you are is
+    // your Google account -- "Sign out" replaces "Change email" and
+    // "Forget saved password".
+    for (const b of [btnOpenNotes, btnNewNotes, btnLoadNotes, btnImportNotes, btnChangeEmail, btnForgetPassword]) b.style.display = 'none';
+    btnSignOut.style.display = '';
+    toolbar.classList.remove('unsaved-pending');
+    return;
+  }
+  btnSignOut.style.display = 'none';
   const editing = build && LiteHusk.mode === 'review' && LiteHusk.canSave;
   btnOpenNotes.style.display = editing ? '' : 'none';
   btnImportNotes.style.display = editing ? '' : (build ? 'none' : btnImportNotes.style.display);
@@ -2815,8 +3210,9 @@ async function openBuiltIn(credential) {
     hideLoading();
   }
   hidePasswordPrompt();
-  showConnected(null); // the build -- notes come from the notes file
-  await connectNotesFile();
+  showConnected(null); // the build
+  if (LiteHusk.remoteNotes) await startGoogleSignIn();  // notes come from the shared sheet
+  else await connectNotesFile();                       // notes come from the notes file
 }
 
 btnStartFromTemplate.addEventListener('click', async () => {
@@ -2832,13 +3228,16 @@ btnStartFromTemplate.addEventListener('click', async () => {
       // Fall through to asking for the password.
     }
   }
+  // Password only: who you are comes after the build opens -- a Google
+  // sign-in when the build has shared notes, else the email prompt
+  // (ensureIdentity).
   askForPassword(async (password) => {
     await openBuiltIn(password);
     await LiteHusk.rememberBuildKey();
-  }, null, { identity: true });
+  });
   setStatus(LiteHusk.fileHandle
     ? `Enter the password to switch to the built-in build (that file's notes stay in ${LiteHusk.fileName}).`
-    : "Enter the password and your email to open the latest build.");
+    : "Enter the password to open the latest build.");
 });
 
 fileInputFallback.addEventListener('change', async () => {
@@ -2991,6 +3390,17 @@ btnImportNotes.addEventListener('click', async () => {
 // would wipe that out from under them.
 // Any failed save, including note saves from inside the wrapped app.
 LiteHusk.onSaveError = (err) => {
+  if (err.name === 'SignInRequiredError' && LiteHusk.remoteNotes) {
+    // Usually an expired Google token: get a fresh one; the note waits in
+    // this browser and goes out with the next save.
+    showProblem('Please sign in with Google again -- your note is kept in this browser and will be saved after you sign in.');
+    startGoogleSignIn();
+    return;
+  }
+  if (err.name === 'NotesStoreError' && LiteHusk.remoteNotes) {
+    showProblem('Not saved yet: ' + err.message + ' Your note is kept in this browser and will be sent with your next change.');
+    return;
+  }
   if (err.name === 'AbortError') {
     setStatus('Not saved -- the save dialog was cancelled. Your next change will ask again.');
   } else {
@@ -2999,6 +3409,7 @@ LiteHusk.onSaveError = (err) => {
 };
 
 LiteHusk.onSaved = (result) => {
+  if (result.mode === 'saved-remote') { showBuildStatus(); if (sharedNotesLoaded) setQuiet(true); return; }
   if (!result.justEstablishedHandle) return;
   if (result.notesFile) {
     toolbar.classList.remove('unsaved-pending');
@@ -3071,10 +3482,48 @@ LiteHusk.onSaved = (result) => {
     if (LiteHusk.hasTemplates) {
       btnOpen.style.display = 'none';
       document.getElementById('welcomeFiles').style.display = 'none';
-      document.getElementById('welcomeBuild').style.display = '';
+      const shared = document.querySelector('meta[name="litehusk-notes"]')?.content === 'shared';
+      // The shared page shows its welcome only if it can't open by itself
+      // (below) -- it used to flash up during every reload's unlock.
+      if (!GOOGLE_OPENS_BUILD) document.getElementById(shared ? 'welcomeShared' : 'welcomeBuild').style.display = '';
       document.getElementById('saveExpectationTitle').textContent = 'Welcome';
       btnStartFromTemplate.textContent = 'Open built-in content';
       btnStartFromTemplate.style.display = '';
+      if (GOOGLE_OPENS_BUILD) {
+        // Reviewers sign in with Google only -- no password on this page
+        // (decided with the user). A device that opened the build before
+        // opens it silently with the remembered key.
+        // With the 30-day pass from an earlier sign-in, it also signs in
+        // by itself -- no Google popup, no button.
+        btnStartFromTemplate.style.display = 'none';
+        showLoading('Opening…');
+        const resumed = LiteHusk.resumeSession(SHARED_NOTES_URL);
+        const remembered = await LiteHusk.recallBuildKey();
+        let opened = false;
+        try {
+          if (remembered) { await LiteHusk.startFromTemplate(remembered); opened = true; }
+        } catch { /* a changed build key: the pass can still open it */ }
+        try {
+          if (!opened && resumed) {
+            await LiteHusk.unlockWithGoogle(SHARED_NOTES_URL, null);
+            await LiteHusk.rememberBuildKey();
+            opened = true;
+          }
+        } catch { /* pass ended: sign in below */ }
+        hideLoading();
+        if (opened) {
+          hidePasswordPrompt();
+          showConnected(null);
+          if (LiteHusk.signedIn) await loadSharedNotes();
+          else await startGoogleSignIn();
+          return;
+        }
+        document.getElementById('welcomeShared').style.display = '';
+        saveExpectationBanner.style.display = '';
+        setStatus('Sign in with Google to open the review page.');
+        await startGoogleSignIn();
+        return;
+      }
       // No file to reconnect to, but this shell carries its own build of
       // the content (embedded or ?template=) -- go straight to it instead
       // of an empty "not connected" screen. Viewing needs no file at all;
